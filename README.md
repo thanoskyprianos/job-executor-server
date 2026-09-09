@@ -1,127 +1,314 @@
-# K24 : HW2
-Athanasios Kyprianos 1115202200082
+# Job Executor Server & Job Commander
 
-### Commands
+A multithreaded client–server system for remotely submitting, queueing and executing
+shell jobs. A central **server** maintains a bounded queue of jobs and a pool of worker
+threads that run them (each job in its own forked child process), while any number of
+lightweight **commander** clients connect over TCP sockets to issue jobs and manage the
+server.
 
-* To compile all files run: `make` or `make all`
-* To clean obj/exe files run: `make clean`
-* To start the server run:
+* **Author:** Athanasios Kyprianos (1115202200082)
+* **Course project:** K24 – HW2 (Systems Programming 2024)
+* **Language:** C/C++ (C++98-compatible, pthreads)
+
+---
+
+## Table of Contents
+
+1. [Overview](#overview)
+2. [Features](#features)
+3. [Requirements](#requirements)
+4. [Build](#build)
+5. [Usage](#usage)
+6. [Commands](#commands)
+7. [Architecture](#architecture)
+8. [Wire Protocol](#wire-protocol)
+9. [Concurrency & Synchronization](#concurrency--synchronization)
+10. [Project Structure](#project-structure)
+11. [Exit Codes](#exit-codes)
+
+---
+
+## Overview
+
 ```
+                 TCP sockets                     fork + execvp
+ jobCommander ───────────────► jobExecutorServer ──────────────► /bin/prog arg1 arg2 ...
+ jobCommander ───────────────►   ┌───────────────┐
+ jobCommander ───────────────►   │  bounded queue│────► worker pool
+        ...                      └───────────────┘
+```
+
+The server listens on a TCP port and for every incoming commander connection spawns a
+dedicated **commander thread** that reads one request, handles it and replies. Jobs are
+placed into a bounded buffer (implemented as a `std::map`, FIFO by increasing job ID)
+and picked up by **worker threads**. Each worker `fork()`s and `execvp()`s the job,
+redirecting the child's stdout to a temporary file so the output can be streamed back
+to the commander that submitted the job.
+
+A single `jobCommander` invocation sends exactly one command and exits, so multiple
+commanders can drive the server concurrently (e.g. from shell scripts).
+
+## Features
+
+- TCP-based client/server communication with a simple binary protocol
+- Bounded job buffer with blocking on both producers and consumers
+- Configurable worker thread pool and concurrency level
+- Per-connection commander threads; every job's output routed back to the correct client
+- Job introspection: poll queued jobs, stop a queued job by ID
+- Runtime concurrency adjustment via `setConcurrency`
+- Graceful shutdown: `exit` waits for running jobs to finish before terminating
+- Clean signal handling (`Ctrl+C` / `SIGUSR1`) with proper mutex/condvar destruction
+
+## Requirements
+
+- Linux (uses POSIX sockets, pthreads, `fork`/`execvp`)
+- `g++` and `make`
+- Linker flag `-lpthread`
+
+## Build
+
+```bash
+make            # or: make all      — builds both binaries into ./bin/
+make clean      # removes binaries and object files
+make help       # prints the usage cheat sheet
+```
+
+Output binaries:
+
+| Binary               | Role        |
+| -------------------- | ----------- |
+| `./bin/jobExecutorServer` | The server |
+| `./bin/jobCommander`     | Client CLI |
+
+## Usage
+
+Start the server first:
+
+```bash
 ./bin/jobExecutorServer [portNum] [bufferSize] [threadPoolSize]
 ```
-* To use the commander do:
-```
+
+| Argument        | Meaning                                        |
+| --------------- | ---------------------------------------------- |
+| `portNum`       | TCP port the server listens on                 |
+| `bufferSize`    | Maximum number of jobs waiting in the buffer   |
+| `threadPoolSize`| Number of worker threads                       |
+
+Then use the commander from any host:
+
+```bash
 ./bin/jobCommander [serverName] [portNum] [jobCommanderInputCommand]
 ```
 
-For more info on command usage do `make help`
+### Examples
 
-### Libraries used
+```bash
+# server on localhost, buffer of 10 jobs, 4 worker threads
+./bin/jobExecutorServer 8080 10 4
 
-* The project is coded in C/C++ and uses several STL utilites:
-    * `std::initializer_list` used by some functions 
-    * `std::map` used as a buffer as described below
-    * `std::string` and `std::stringstream` for string manipulation
-    * `std::vector` used for saving variable number of elements (e.g. job arguments)
+# submit jobs
+./bin/jobCommander localhost 8080 issueJob ls -la /tmp
+./bin/jobCommander localhost 8080 issueJob /bin/sleep 20
+./bin/jobCommander localhost 8080 issueJob touch /tmp/hello
 
-* It also uses libraries such as:
-    * `arpa/inet.h` for handling byte ordering
-    * `sys/sockets.h`: C sockets for transfering data between commander and server
-    * `pthread.h`: C threads for multithreading
+# inspect the queue
+./bin/jobCommander localhost 8080 poll
+# JOB <job_1, ls -la /tmp>
+# JOB <job_2, /bin/sleep 20>
+# ...
 
-### Files and directories
+# remove a queued job
+./bin/jobCommander localhost 8080 stop job_2
 
-The project is organized as such:
+# change how many jobs may run at once
+./bin/jobCommander localhost 8080 setConcurrency 2
 
-* `bin/` contains the executable files after compilation
-* `build/` contains object files after compilation (commander and server are seperated)
-* `include/` contains headers files:
-    * `codes.hpp` is a header file used by both the commander and the server that contains error codes and other useful definitions
-    * `include/commander` contains header files used by the commander
-    * `include/server` contains header files used by the server
-* `src/` contains source code for commander and server
-    * `src/commander` source code of commander
-    * `src/server` source code of server
-* `Makefile` is used for compiling, cleaning and help as described in the beggining
-* `help` is the file that is "cat" when executing `make help`
-* `syspro2024_hw2_completion_report.pdf` is the completion report
-* `README.md` is this file
+# shut the server down (after running jobs finish)
+./bin/jobCommander localhost 8080 exit
+```
 
-### Other choices
-The project is mainly focused around the use of namespaces that keep each individual component organized (Fetching, Requesting, Responding, Executing etc.)
+## Commands
 
-### Job Commander
-The job commander consists of the following:
-* `commander.cpp`: The main commander file that:
-    * Resolves the hostname givven into an IP address
-    * Connects to the server on ip:port
-    * Calls functions from the `Requester` namespace based on the user's input
-    * Waits for server response
-* `requester.cpp` and `requester.hpp`: These files implement the `Requester` namespace that is responsible for taking the input the user gives and sending it through the socket the server opened.
+### Commander
 
-The messages the commander sends follow this protocol:
+| Command              | Arguments           | Description                                        |
+| -------------------- | ------------------- | -------------------------------------------------- |
+| `issueJob`           | `<job> [args...]`   | Submit a job (executable + arguments)              |
+| `setConcurrency`     | `<N>`               | Set server concurrency level to `N`                |
+| `stop`               | `job_<id>`          | Remove a queued (not running) job from the buffer  |
+| `poll`               | –                   | Print all queued jobs                              |
+| `exit`               | –                   | Terminate server after running jobs finish         |
 
-* Firstly, each command calls the headers function that sends the specific code for each command (these codes are found in the `codes.hpp` header file)
-* Then for each command the following happens:
-    * `issueJob()`: For each argument the user gives, the Requester sends the pair `(len(arg), arg)`. As such, the server knows how many bytes the next word is going to be. In other words, the server gets the following message:
+### Server responses
 
-    ```
-    10 (ISSUE_JOB)
-    len(arg_1) arg_1
-    len(arg_2) arg_2
-    ...
-    len(arg_n) arg_n
-    (EOF)
-    ```
-    * `setConcurrency()`: For this command, all the Requester does is send the code and the new concurrency value given by the user:
-    ```
-    11 (SET_CONCURRENCY)
-    N (uint32_t)
-    (EOF)
-    ```
-    * `stop()`: The Requester sends the code, then extracts the number value from the job_xx string the user passes and sends it through the socket:
-    ```
-    12 (STOP_JOB)
-    Id (uint32_t)
-    (EOF)
-    ```
+| Command            | Typical response                              |
+| ------------------ | --------------------------------------------- |
+| `issueJob`         | `JOB <job_1, args> SUBMITTED` + job output    |
+| `setConcurrency`   | `CONCURRENCY SET AT N`                        |
+| `stop`             | `JOB <job_N> REMOVED` or `JOB <job_N> NOTFOUND` |
+| `poll`             | one `JOB <job_N, args>` triplet per line      |
+| `exit`             | `SERVER TERMINATED`                           |
 
-    * `poll()` and `exit()`: For these final two functions, all the Requester has to do is send the code, as they don't require any more arguments:
-    ```
-    13 (POLL_JOBS)
-    (EOF)
-    ```
-    ```
-    14 (EXIT_SERVER)
-    (EOF)
-    ```
+When a queued job is discarded (stopped, or server shuts down), the commander that
+submitted it receives `JOB STOPPED BEFORE EXECUTION` / `SERVER TERMINATED BEFORE
+EXECUTION` on its socket.
 
-As a final note, `shutdown(sock, SHUT_WR)` is called to notify the server we are done writing (EOF).
+## Architecture
 
-### Job Executor Server
+The code is organized around namespaces, one per responsibility:
 
-The job executor server consists of the following:
-* `server.cpp`: The main server file responsible for the following:
-    * Creates the passive communication socket and waits for commander connections
-    * Creates a number of `worker threads` (specified by the user) that execute the jobs issued by the commanders
-    * For each connected commander it creates a `commander thread` that uses functions from the `Fetcher`, `Executor` and `Respondent` namespaces accordingly.
-    * A special case is when exit is called. At this point the `commander thread` kills the `main thread` using the `pthread_kill` function which forces the program out of the main loop and into a signal handler that does cleanup.
-* `fetcher.cpp` and `fetcher.hpp`: The `Fetcher` namespace contains functions that are used to fetch the requests the commanders send. The `Fetcher::headers()` function extract the command code (codes.hpp) if the codes is 10 (issueJob), 11 (SET_CONCURRENCY) or 12 (STOP_JOB) the corresponding functions `Fetcher::issueJob()`, `Fetcher::setConcurrency()` and `Fetcher::stop()` are used to extract the extra data following the protocol described above.
-* `executor.cpp` and `executor.hpp`: The `Executor` namespace is used to handle the data after fetching them i.e. issuing jobs in the buffer, setting the concurrency of the server or stopping a job. It also gives the `worker threads` the next available job and contains definitions of the following important variables and structures:
-    * `struct Job`: The `Job` struct describes a job that is ready to be handled by a worker, it contains info such as its arguments, its jobId as well as the socket from which the job data was sent.
-    * `internal`: The `internal` namespace contains the definition of some crucial variables that are used throughout the whole execution of the server. These are:
-        * `running`: Boolean value that lets threads know the server should still be running.
-        * `runningJobs`: The number of running jobs, needed by workers to know if they can execute the next job.
-        * `incJobId`: The increasing job Id assigned to jobs on their insertion in the buffer.
-        * `concurrencyLevel`: The number of jobs that can run at the same time. Changed by the setConcurrency command.
-        * `bufferSize`: The theoretical size of the buffer (as the buffer is a map as described below).
-        * `jobsBuffer`: The buffer that stores jobs until they are executed. Even though it is an `std::map`, it is also used as a queue as it keeps the ordering of incoming jobs (the jobId is always incresing). It is also useful for finding jobs quickly based on their jobId.
-* `respondent.cpp` and `respondent.hpp`: The `Respondent` namespace is used after the execution of the commands to return resulting messages to the commanders.
-* `sync.cpp` and `sync.hpp`: These files contain the `Mutex` and `Cond` namespaces that in turn contain mutexes and conditional variables used for synchronization between threads as described below.
+```
+jobExecutorServer
+│
+├── main thread (server.cpp)
+│     ├── listens/accepts TCP connections
+│     ├── spawns threadPool worker threads
+│     └── spawns one detached commander thread per connection
+│
+├── commander thread ──► Fetcher::headers() reads the command code
+│     └── dispatches to Fetcher::issueJob() / setConcurrency() / stop()
+│     └── calls Executor::* which use Respondent::* to reply
+│
+├── worker thread ──► waits on Cond::runtimeWorker
+│     ├── Executor::next() pops the FIFO job from the buffer
+│     ├── fork() + execvp() with stdout → /tmp/<pid>.output
+│     └── Respondent::jobOutput() streams the file back to the client
+│
+└── Executor::internal  (shared state, guarded by Mutex::runtime / Mutex::concurrency)
+      running, runningJobs, incJobId, concurrencyLevel, bufferSize, jobsBuffer
+```
 
-### Threads and Synchronization
-To synchronize the `worker` and `commander` threads and avoid race conditions, a couple of mutexes are used:
-* `Mutex::runtime`: The `runtime` mutex guards the `jobBuffer`, as well as the `running` boolean variable. Specifically, the `commanders` lock it so they can access the jobBuffer to check if it has space when issuing jobs or when stoping jobs and the `workers` when trying to check if the jobBuffer is not empty and there are available jobs to execute. All of them also check if the server is still running. If not they stop their execution and wait for the main thread to do its thing. Lastly the `Respondent` locks it when polling queued jobs.
-* `Mutex::concurrency`: The `concurrency` mutex is locked by worker when they wake up to see if they can run another job based on the now safe to access `runningJobs` and `concurrencyLevel` variables. It is also locked by the `Executor` when changing the `concurrencyLevel` variable.
+### The Job buffer
 
-When the `worker` or `commander` conditions are not met i.e. the jobBuffer is empty or not empty accordingly, they wait on the `Cond::runtimeWorker` and `Cond::runtimeCommander` conditional variables. When the criteria is met they are woken up and they continue their execution.
+`Executor::internal::jobsBuffer` is a `std::map<uint32_t, Job*>` keyed by an
+ever-increasing job ID. Because keys only grow, iterating from `begin()` yields FIFO
+order, while lookups for `stop`/`poll` are O(log n).
+
+### Shared state (`Executor::internal`)
+
+| Variable           | Purpose                                                        |
+| ------------------ | -------------------------------------------------------------- |
+| `running`          | Server shutdown flag                                           |
+| `runningJobs`      | Jobs currently executing (bounded by `concurrencyLevel`)       |
+| `incJobId`         | Monotonic ID source assigned on buffer insertion               |
+| `concurrencyLevel` | Max jobs running at once (adjustable at runtime)               |
+| `bufferSize`       | Buffer capacity (fixed at startup)                             |
+| `jobsBuffer`       | The job queue described above                                  |
+
+## Wire Protocol
+
+All multi-byte integers are sent in network byte order (big-endian, `htonl`/`ntohl`).
+The commander sends a request, then calls `shutdown(sock, SHUT_WR)` to signal EOF.
+The server responds with zero or more length-prefixed messages:
+
+```
+[uint32 len][payload bytes]...
+```
+
+### Requests
+
+**`issueJob`** — code `10`
+
+```
+10
+len(arg_1) arg_1
+len(arg_2) arg_2
+...
+(EOF via SHUT_WR)
+```
+
+**`setConcurrency`** — code `11`
+
+```
+11
+N (uint32_t)
+(EOF)
+```
+
+**`stop`** — code `12`
+
+```
+12
+jobId (uint32_t)
+(EOF)
+```
+
+**`poll`** — code `13` / **`exit`** — code `14`
+
+```
+13 | 14
+(EOF)
+```
+
+Command codes are defined in `include/codes.hpp`.
+
+## Concurrency & Synchronization
+
+Two mutexes and two condition variables coordinate the threads
+(`include/server/sync.hpp`, `src/server/sync.cpp`):
+
+| Primitive              | Protects                                             |
+| ---------------------- | ---------------------------------------------------- |
+| `Mutex::runtime`       | `jobsBuffer`, `running`, job submission/stopping, polling |
+| `Mutex::concurrency`   | `runningJobs`, `concurrencyLevel`                    |
+| `Cond::runtimeWorker`  | Wakes workers when a job enters the buffer           |
+| `Cond::runtimeCommander` | Wakes commanders when buffer space frees up        |
+
+- **Commanders** lock `runtime` to insert a job (blocking on `runtimeCommander` while
+  the buffer is full) or to stop/poll jobs.
+- **Workers** wait on `runtimeWorker` while the buffer is empty; when a job arrives
+  they re-check `concurrency` and pop the FIFO head, then broadcast
+  `runtimeCommander` to announce free buffer space.
+- **Exit:** the commander thread handling `exit` sets `running = false`, broadcasts
+  both condition variables, and delivers `SIGUSR1` to the main thread. The signal
+  handler joins all workers, destroys the synchronization primitives, notifies the
+  commanders of still-queued jobs, replies `SERVER TERMINATED` to the exit caller and
+  cleans up.
+
+## Project Structure
+
+```
+.
+├── Makefile                  # build, clean, help targets
+├── help                      # usage cheat sheet printed by `make help`
+├── README.md                 # this file
+├── include/
+│   ├── codes.hpp             # shared error & command codes
+│   ├── commander/
+│   │   └── requester.hpp     # client-side request sender interface
+│   └── server/
+│       ├── executor.hpp      # Job struct + shared buffer state
+│       ├── fetcher.hpp       # server-side request parser interface
+│       ├── respondent.hpp    # server-side response writer interface
+│       └── sync.hpp          # mutexes & condition variables
+├── src/
+│   ├── commander/
+│   │   ├── commander.cpp     # CLI entry point, socket setup
+│   │   └── requester.cpp     # request encoding/writing
+│   └── server/
+│       ├── server.cpp        # main, accept loop, worker/commander routines, signals
+│       ├── executor.cpp      # buffer operations (issue/stop/next), Job
+│       ├── fetcher.cpp       # request decoding/reading
+│       ├── respondent.cpp    # response encoding/writing, output streaming
+│       └── sync.cpp          # mutex/condvar definitions
+├── syspro2024_hw2_completion_report.pdf   # assignment completion report
+├── bin/                      # (created by make) executables
+└── build/                    # (created by make) object files
+```
+
+## Exit Codes
+
+Error codes shared by both binaries (`include/codes.hpp`):
+
+| Code | Constant        | Meaning                          |
+| ---- | --------------- | -------------------------------- |
+| 1    | `USAGE_ERROR`   | Invalid command-line usage       |
+| 2    | `HOSTNAME_ERROR`| Hostname resolution failure      |
+| 3    | `VALUE_ERROR`   | Invalid numeric argument         |
+| 4    | `NETWORK_ERROR` | Network failure                  |
+| 5    | `PROCCESS_ERROR`| Read/write (processing) failure  |
+| 6    | `THREAD_ERROR`  | Thread creation/join failure     |
+| 7    | `SOCKET_ERROR`  | Socket operation failure         |
+| 8    | `EXEC_ERROR`    | `fork`/`exec` failure            |
+
+Codes `10`–`15` are the protocol command codes used by the wire protocol above.
